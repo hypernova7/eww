@@ -31,6 +31,7 @@ use crate::{
 
 use super::widget_definitions::{resolve_orientable_attrs, resolve_range_attrs, resolve_widget_attrs};
 
+#[derive(Debug)]
 pub struct BuilderArgs<'a> {
     pub calling_scope: ScopeIndex,
     pub widget_use: BasicWidgetUse,
@@ -306,13 +307,14 @@ fn build_children_special_widget(
                             .children
                             .get(nth_value as usize)
                             .with_context(|| format!("No child at index {}", nth_value))?;
-                        let new_child_widget = build_gtk_widget(
-                            tree,
-                            widget_defs.clone(),
-                            custom_widget_invocation.scope,
-                            nth_child_widget_use.clone(),
-                            None,
+                        let scope = tree.register_new_scope(
+                            format!("child {nth_value}"),
+                            Some(custom_widget_invocation.scope),
+                            calling_scope,
+                            HashMap::new(),
                         )?;
+                        let new_child_widget =
+                            build_gtk_widget(tree, widget_defs.clone(), scope, nth_child_widget_use.clone(), None)?;
                         child_container.children().iter().for_each(|f| child_container.remove(f));
                         child_container.set_child(Some(&new_child_widget));
                         new_child_widget.show();
@@ -323,7 +325,13 @@ fn build_children_special_widget(
         )?;
     } else {
         for child in &custom_widget_invocation.children {
-            let child_widget = build_gtk_widget(tree, widget_defs.clone(), custom_widget_invocation.scope, child.clone(), None)?;
+            let scope = tree.register_new_scope(
+                String::from("child"),
+                Some(custom_widget_invocation.scope),
+                calling_scope,
+                HashMap::new(),
+            )?;
+            let child_widget = build_gtk_widget(tree, widget_defs.clone(), scope, child.clone(), None)?;
             gtk_container.add(&child_widget);
         }
     }
@@ -334,6 +342,7 @@ fn build_children_special_widget(
 /// remembered whilst building it's content. If the body of the custom widget uses a `children`
 /// widget, the children originally passed to the widget need to be set.
 /// This struct represents that context
+#[derive(Debug)]
 pub struct CustomWidgetInvocation {
     /// The scope the custom widget was invoked in
     scope: ScopeIndex,
