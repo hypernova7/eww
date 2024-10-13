@@ -293,7 +293,9 @@ impl ScopeGraph {
         if let Some(triggered_listeners) = scope.listeners.get(updated_var) {
             for listener in triggered_listeners.clone() {
                 let required_variables = self.lookup_variables_in_scope(scope_index, &listener.needed_variables)?;
-                if let Err(err) = (*listener.f)(self, required_variables).context("Error while updating UI after state change") {
+                if let Err(err) = (*listener.f)(self, required_variables)
+                    .context(format!("Error while updating UI after state change, on updated var: {}", updated_var))
+                {
                     error_handling_ctx::print_error(err);
                 }
             }

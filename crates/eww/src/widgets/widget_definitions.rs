@@ -13,15 +13,8 @@ use gdk::{ModifierType, NotifyType};
 use glib::translate::FromGlib;
 use gtk::{self, glib, prelude::*, DestDefaults, TargetEntry, TargetList};
 use itertools::Itertools;
-use once_cell::sync::Lazy;
 
-use std::{
-    cell::RefCell,
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    rc::Rc,
-    time::Duration,
-};
+use std::{cell::RefCell, cmp::Ordering, collections::HashMap, rc::Rc, time::Duration};
 use yuck::{
     config::file_provider::YuckFileProvider,
     error::{DiagError, DiagResult},
@@ -80,6 +73,10 @@ pub const BUILTIN_WIDGET_NAMES: &[&str] = &[
     WIDGET_NAME_CHECKBOX,
     WIDGET_NAME_REVEALER,
     WIDGET_NAME_SCROLL,
+    WIDGET_NAME_LISTBOX,
+    WIDGET_NAME_LISTROW,
+    WIDGET_NAME_MENU,
+    WIDGET_NAME_MENU_OPTION,
     WIDGET_NAME_OVERLAY,
     WIDGET_NAME_STACK,
     WIDGET_NAME_SYSTRAY,
@@ -110,6 +107,10 @@ pub(super) fn widget_use_to_gtk_widget(bargs: &mut BuilderArgs) -> Result<gtk::W
         WIDGET_NAME_CHECKBOX => build_gtk_checkbox(bargs)?.upcast(),
         WIDGET_NAME_REVEALER => build_gtk_revealer(bargs)?.upcast(),
         WIDGET_NAME_SCROLL => build_gtk_scrolledwindow(bargs)?.upcast(),
+        WIDGET_NAME_LISTROW => build_gtk_listrow(bargs)?.upcast(),
+        WIDGET_NAME_LISTBOX => build_gtk_listbox(bargs)?.upcast(),
+        WIDGET_NAME_MENU_OPTION => build_gtk_menu_option(bargs)?.upcast(),
+        WIDGET_NAME_MENU => build_gtk_menu(bargs)?.upcast(),
         WIDGET_NAME_OVERLAY => build_gtk_overlay(bargs)?.upcast(),
         WIDGET_NAME_STACK => build_gtk_stack(bargs)?.upcast(),
         WIDGET_NAME_SYSTRAY => build_systray(bargs)?.upcast(),
@@ -125,8 +126,7 @@ pub(super) fn widget_use_to_gtk_widget(bargs: &mut BuilderArgs) -> Result<gtk::W
 }
 
 /// Deprecated attributes from top of widget hierarchy
-static DEPRECATED_ATTRS: Lazy<HashSet<&str>> =
-    Lazy::new(|| ["timeout", "onscroll", "onhover", "cursor"].iter().cloned().collect());
+static DEPRECATED_ATTRS: &[&str] = &["timeout", "onscroll", "onhover", "cursor"];
 
 /// attributes that apply to all widgets
 /// @widget widget
@@ -220,8 +220,83 @@ pub(super) fn resolve_widget_attrs(bargs: &mut BuilderArgs, gtk_widget: &gtk::Wi
             css_provider2.load_from_data(grass::from_string(css, &grass::Options::default())?.as_bytes())?;
             gtk_widget.style_context().add_provider(&css_provider2, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION)
         },
+        prop(menu: as_string) {
+            if let Ok(items) = serde_json::from_str::<Vec<ContextMenu>>(&menu) {
+                let context_menu = build_context_menu(items);
+                let context_menu2 = context_menu.clone();
+
+                gtk_widget.add_events(gdk::EventMask::KEY_PRESS_MASK);
+                gtk_widget.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+
+                connect_signal_handler!(
+                    gtk_widget,
+                    gtk_widget.connect_key_press_event(move |_, evt| {
+                        match evt.keyval().name() {
+                            Some(name) if name.as_str() == "Menu" => context_menu.popup_at_pointer(Some(evt)),
+                            _ => {}
+                        };
+
+                        gtk::Inhibit(false)
+                    })
+                );
+                connect_signal_handler!(
+                    gtk_widget,
+                    gtk_widget.connect_button_press_event(move |_, evt| {
+                        match evt.button() {
+                            1 => context_menu2.clone().popdown(),
+                            3 => context_menu2.clone().popup_at_pointer(Some(evt)),
+                            _ => {}
+                        };
+
+                        gtk::Inhibit(false)
+                    })
+                );
+            }
+        }
     });
     Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ContextMenu {
+    label: String,
+    action: Option<String>,
+    #[serde(default)]
+    timeout: Timeout,
+    submenu: Option<Vec<ContextMenu>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Timeout(Duration);
+impl Default for Timeout {
+    fn default() -> Timeout {
+        Timeout(Duration::from_millis(200))
+    }
+}
+
+fn build_context_menu(items: Vec<ContextMenu>) -> gtk::Menu {
+    let context_menu = gtk::Menu::new();
+
+    for item in items {
+        let menu_item = gtk::MenuItem::with_label(&item.label);
+
+        if let Some(action) = item.action {
+            menu_item.connect_activate(move |_| {
+                run_command(item.timeout.0, &action, &[] as &[&str]);
+            });
+        }
+
+        if let Some(submenu) = item.submenu {
+            let menu = build_context_menu(submenu);
+            menu_item.set_submenu(Some(&menu));
+        }
+
+        context_menu.append(&menu_item);
+    }
+
+    context_menu.show_all();
+
+    context_menu
 }
 
 /// @widget !range
@@ -538,55 +613,31 @@ fn build_gtk_image(bargs: &mut BuilderArgs) -> Result<gtk::Image> {
         // @prop image-height - height of the image
         prop(path: as_string, image_width: as_i32 = -1, image_height: as_i32 = -1, fill: as_string = "") {
             if !path.ends_with(".svg") && !fill.is_empty() {
-                log::warn!("The fill attribute is only for SVG images");
+                log::warn!("The fill attribute is only for SVG images.");
             }
 
             if path.ends_with(".gif") {
                 let pixbuf_animation = gtk::gdk_pixbuf::PixbufAnimation::from_file(std::path::PathBuf::from(path))?;
                 gtk_widget.set_from_animation(&pixbuf_animation);
-            } else if path.ends_with(".svg") && !fill.is_empty() {
-                let svg_data = std::fs::read_to_string(std::path::PathBuf::from(path.clone()))?;
-
-                // The fastest way to add/change fill color
-                let svg_data = if svg_data.contains("fill=") {
-                    let reg = regex::Regex::new(r#"fill="[^"]*""#)?;
-                    reg.replace(&svg_data, &format!("fill=\"{}\"", fill))
-                } else {
-                    let reg = regex::Regex::new(r"<svg")?;
-                    reg.replace(&svg_data, &format!("<svg fill=\"{}\"", fill))
-                };
-
-                let pixbuf_svg = gtk::gdk_pixbuf::PixbufLoader::with_type("svg")?;
-                // To determine the size of svg image
-                // NOTE: Convertions to f64 are intentional to prevent negative or zero values
-                // which cause some images with rectangular dimensions to not be displayed
-                // if at least one of the image-width/image-height attributes is used
-                //
-                // For example, we have a rectangular image with dimensions 300x130(width = 300, height = 130),
-                // and the user only wants to use the attribute :image-width 18,
-                // then the aspect ratio to calculate the height would be
-                // aspect_ratio_h = (height / width); // return 0, then aspect_ration_h * 18 = 0
-                // aspect_ratio_h = (height as f64 / width as f64); // return 0.4333333333333, then aspect_ratio_h * 18.0 = 7.8 as i32 = 7
-                pixbuf_svg.connect_size_prepared(move |pixbuf_svg, svg_width, svg_height| {
-                    let aspect_ratio_h = svg_height as f64 / svg_width as f64;
-                    let aspect_ratio_w = svg_width as f64/ svg_height as f64;
-
-                    match (image_width, image_height) {
-                        // If only define the image-width attribute, then preserve the aspect ratio for the svg height
-                        (w, _) if w >= 0 => pixbuf_svg.set_size(w, (aspect_ratio_h * w as f64) as i32),
-                        // If only define the image-height attribute, then preserve the aspect ratio for the svg width
-                        (_, h) if h >= 0 => pixbuf_svg.set_size((aspect_ratio_w * h as f64) as i32, h),
-                        // If both attributes image-width and image-height are difined, then use it
-                        (w, h) if w >= 0 && h >= 0 => pixbuf_svg.set_size(w, h),
-                        _ => {}
-                    };
-                });
-                pixbuf_svg.write(svg_data.as_bytes())?;
-                pixbuf_svg.close()?;
-
-                gtk_widget.set_from_pixbuf(pixbuf_svg.pixbuf().as_ref());
             } else {
-                let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file_at_size(std::path::PathBuf::from(path), image_width, image_height)?;
+                let pixbuf;
+                // populate the pixel buffer
+                if path.ends_with(".svg") && !fill.is_empty() {
+                    let svg_data = std::fs::read_to_string(std::path::PathBuf::from(path.clone()))?;
+                    // The fastest way to add/change fill color
+                    let svg_data = if svg_data.contains("fill=") {
+                        let reg = regex::Regex::new(r#"fill="[^"]*""#)?;
+                        reg.replace(&svg_data, &format!("fill=\"{fill}\""))
+                    } else {
+                        let reg = regex::Regex::new(r"<svg")?;
+                        reg.replace(&svg_data, &format!("<svg fill=\"{fill}\""))
+                    };
+                    let stream = gtk::gio::MemoryInputStream::from_bytes(&gtk::glib::Bytes::from(svg_data.as_bytes()));
+                    pixbuf = gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(&stream, image_width, image_height, true, None::<&gtk::gio::Cancellable>)?;
+                    stream.close(None::<&gtk::gio::Cancellable>)?;
+                } else {
+                    pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(std::path::PathBuf::from(path), image_width, image_height, true)?;
+                }
                 gtk_widget.set_from_pixbuf(Some(&pixbuf));
             }
         },
@@ -742,6 +793,121 @@ fn build_center_box(bargs: &mut BuilderArgs) -> Result<gtk::Box> {
     }
 }
 
+const WIDGET_NAME_MENU: &str = "menu";
+fn build_gtk_menu(bargs: &mut BuilderArgs) -> Result<gtk::Box> {
+    let gtk_widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let menu = gtk::Menu::new();
+
+    let children = bargs.widget_use.children.iter().map(|child| {
+        build_gtk_widget(
+            bargs.scope_graph,
+            bargs.widget_defs.clone(),
+            bargs.calling_scope,
+            child.clone(),
+            bargs.custom_widget_invocation.clone(),
+        )
+    });
+
+    for child in children {
+        if let Some(menu_item) = child?.dynamic_cast_ref::<gtk::MenuItem>() {
+            menu.append(menu_item);
+        }
+    }
+
+    gtk_widget.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+    connect_signal_handler!(
+        gtk_widget,
+        gtk_widget.connect_button_press_event(move |_, evt| {
+            match evt.button() {
+                1 => menu.popdown(),
+                3 => menu.popup_easy(evt.button(), evt.time()),
+                _ => {}
+            };
+
+            gtk::Inhibit(false)
+        })
+    );
+
+    Ok(gtk_widget)
+}
+
+const WIDGET_NAME_MENU_OPTION: &str = "option";
+fn build_gtk_menu_option(bargs: &mut BuilderArgs) -> Result<gtk::MenuItem> {
+    let gtk_widget = gtk::MenuItem::new();
+
+    def_widget!(bargs, _g, gtk_widget, {
+        prop(label: as_string) {
+            gtk_widget.set_label(&label);
+        },
+        prop(onclick: as_string, timeout: as_duration = Duration::from_millis(200)) {
+            gtk_widget.connect_activate(move |_| {
+                run_command(timeout, &onclick, &[] as &[&str]);
+            });
+        }
+    });
+
+    Ok(gtk_widget)
+}
+
+const WIDGET_NAME_LISTBOX: &str = "listbox";
+fn build_gtk_listbox(bargs: &mut BuilderArgs) -> Result<gtk::ListBox> {
+    let gtk_widget = gtk::ListBox::new();
+
+    gtk_widget.connect_row_selected(|gtk_widget, listrow| {
+        if let Some(row) = listrow {
+            if let Some(adjustment) = gtk_widget.adjustment() {
+                let page_size = adjustment.page_size();
+                let height = row.allocation().height();
+                let width = row.allocation().width();
+                let x = row.allocation().x();
+                let y = row.allocation().y();
+
+                let offsety = page_size - height as f64;
+                let offsetx = page_size - width as f64;
+
+                if x >= 0 {
+                    adjustment.set_value(x as f64 - offsetx / 2.0);
+                }
+
+                if y >= 0 {
+                    adjustment.set_value(y as f64 - offsety / 2.0);
+                }
+            }
+            row.grab_focus();
+        }
+    });
+
+    def_widget!(bargs, _g, gtk_widget, {
+        prop(position: as_i32 = 0) {
+            gtk_widget.select_row(gtk_widget.row_at_index(position).as_ref());
+        },
+        prop(mode: as_string = "browse") {
+            match mode.as_str() {
+                "browse" => gtk_widget.set_selection_mode(gtk::SelectionMode::Browse),
+                "multiple" => gtk_widget.set_selection_mode(gtk::SelectionMode::Multiple),
+                "single" => gtk_widget.set_selection_mode(gtk::SelectionMode::Single),
+                _ => gtk_widget.set_selection_mode(gtk::SelectionMode::None),
+            }
+        }
+    });
+
+    Ok(gtk_widget)
+}
+
+const WIDGET_NAME_LISTROW: &str = "listrow";
+fn build_gtk_listrow(bargs: &mut BuilderArgs) -> Result<gtk::ListBoxRow> {
+    let gtk_widget = gtk::ListBoxRow::new();
+
+    def_widget!(bargs, _g, gtk_widget, {
+        prop(activatable: as_bool = true, selectable: as_bool = true) {
+            gtk_widget.set_activatable(activatable);
+            gtk_widget.set_selectable(selectable);
+        }
+    });
+
+    Ok(gtk_widget)
+}
+
 const WIDGET_NAME_SCROLL: &str = "scroll";
 /// @widget scroll
 /// @desc a container with a single child that can scroll.
@@ -757,7 +923,7 @@ fn build_gtk_scrolledwindow(bargs: &mut BuilderArgs) -> Result<gtk::ScrolledWind
                 if hscroll { gtk::PolicyType::Automatic } else { gtk::PolicyType::Never },
                 if vscroll { gtk::PolicyType::Automatic } else { gtk::PolicyType::Never },
             )
-        },
+        }
     });
 
     Ok(gtk_widget)
@@ -792,6 +958,11 @@ fn build_gtk_event_box(bargs: &mut BuilderArgs) -> Result<gtk::EventBox> {
 
     gtk_widget.connect_button_release_event(|gtk_widget, _| {
         gtk_widget.clone().unset_state_flags(gtk::StateFlags::ACTIVE);
+        gtk::Inhibit(false)
+    });
+
+    gtk_widget.connect_key_press_event(|gtk_widget, _| {
+        gtk_widget.clone().set_state_flags(gtk::StateFlags::ACTIVE, false);
         gtk::Inhibit(false)
     });
 
@@ -925,6 +1096,20 @@ fn build_gtk_event_box(bargs: &mut BuilderArgs) -> Result<gtk::EventBox> {
                 }
                 gtk::Inhibit(false)
             }));
+        },
+        prop(timeout: as_duration = Duration::from_millis(200), keypress: as_string) {
+            gtk_widget.add_events(gdk::EventMask::KEY_PRESS_MASK);
+
+            connect_signal_handler!(
+                gtk_widget,
+                gtk_widget.connect_key_press_event(move |_, evt| {
+                    match evt.keyval().name() {
+                        Some(keyname) => run_command(timeout, &keypress, &[keyname]),
+                        _ => {}
+                    }
+                    gtk::Inhibit(false)
+                })
+            );
         }
     });
 
@@ -1133,6 +1318,27 @@ const WIDGET_NAME_STACK: &str = "stack";
 /// @desc A widget that displays one of its children at a time
 fn build_gtk_stack(bargs: &mut BuilderArgs) -> Result<gtk::Stack> {
     let gtk_widget = gtk::Stack::new();
+
+    if let Ordering::Less = bargs.widget_use.children.len().cmp(&1) {
+        return Err(DiagError(gen_diagnostic!("stack must contain at least one element", bargs.widget_use.span)).into());
+    }
+
+    let children = bargs.widget_use.children.iter().map(|child| {
+        build_gtk_widget(
+            bargs.scope_graph,
+            bargs.widget_defs.clone(),
+            bargs.calling_scope,
+            child.clone(),
+            bargs.custom_widget_invocation.clone(),
+        )
+    });
+
+    for (i, child) in children.enumerate() {
+        let child = child?;
+        gtk_widget.add_named(&child, &i.to_string());
+        child.show();
+    }
+
     def_widget!(bargs, _g, gtk_widget, {
         // @prop selected - index of child which should be shown
         prop(selected: as_i32) { gtk_widget.set_visible_child_name(&selected.to_string()); },
@@ -1142,28 +1348,7 @@ fn build_gtk_stack(bargs: &mut BuilderArgs) -> Result<gtk::Stack> {
         prop(same_size: as_bool = false) { gtk_widget.set_homogeneous(same_size); }
     });
 
-    match bargs.widget_use.children.len().cmp(&1) {
-        Ordering::Less => {
-            Err(DiagError(gen_diagnostic!("stack must contain at least one element", bargs.widget_use.span)).into())
-        }
-        Ordering::Greater | Ordering::Equal => {
-            let children = bargs.widget_use.children.iter().map(|child| {
-                build_gtk_widget(
-                    bargs.scope_graph,
-                    bargs.widget_defs.clone(),
-                    bargs.calling_scope,
-                    child.clone(),
-                    bargs.custom_widget_invocation.clone(),
-                )
-            });
-            for (i, child) in children.enumerate() {
-                let child = child?;
-                gtk_widget.add_named(&child, &i.to_string());
-                child.show();
-            }
-            Ok(gtk_widget)
-        }
-    }
+    Ok(gtk_widget)
 }
 
 const WIDGET_NAME_TRANSFORM: &str = "transform";
