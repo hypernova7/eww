@@ -8,13 +8,19 @@ use crate::{
 use anyhow::{anyhow, Context, Result};
 use codespan_reporting::diagnostic::Severity;
 use eww_shared_util::Spanned;
-use gdk::{ModifierType, NotifyType};
+use gdk::{EventKey, ModifierType, NotifyType};
 
 use glib::translate::FromGlib;
 use gtk::{self, glib, prelude::*, DestDefaults, TargetEntry, TargetList};
 use itertools::Itertools;
 
-use std::{cell::RefCell, cmp::Ordering, collections::HashMap, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    time::Duration,
+};
 use yuck::{
     config::file_provider::YuckFileProvider,
     error::{DiagError, DiagResult},
@@ -966,6 +972,11 @@ fn build_gtk_event_box(bargs: &mut BuilderArgs) -> Result<gtk::EventBox> {
         gtk::Inhibit(false)
     });
 
+    gtk_widget.connect_key_release_event(|gtk_widget, _| {
+        gtk_widget.clone().unset_state_flags(gtk::StateFlags::ACTIVE);
+        gtk::Inhibit(false)
+    });
+
     def_widget!(bargs, _g, gtk_widget, {
         // @prop timeout - timeout of the command. Default: "200ms"
         // @prop onscroll - event to execute when the user scrolls with the mouse over the widget. The placeholder `{}` used in the command will be replaced with either `up` or `down`.
@@ -1099,21 +1110,105 @@ fn build_gtk_event_box(bargs: &mut BuilderArgs) -> Result<gtk::EventBox> {
         },
         prop(timeout: as_duration = Duration::from_millis(200), keypress: as_string) {
             gtk_widget.add_events(gdk::EventMask::KEY_PRESS_MASK);
+            gtk_widget.add_events(gdk::EventMask::KEY_RELEASE_MASK);
+            gtk_widget.add_events(gdk::EventMask::LEAVE_NOTIFY_MASK);
 
-            connect_signal_handler!(
-                gtk_widget,
-                gtk_widget.connect_key_press_event(move |_, evt| {
-                    match evt.keyval().name() {
-                        Some(keyname) => run_command(timeout, &keypress, &[keyname]),
-                        _ => {}
-                    }
-                    gtk::Inhibit(false)
-                })
-            );
+            let keyboard_handler = Rc::new(RefCell::new(KeyboardHandler::new()));
+            let keyboard_handler1 = keyboard_handler.clone();
+            let keyboard_handler2 = keyboard_handler.clone();
+            let keypress1 = keypress.clone();
+
+            connect_signal_handler!(gtk_widget, gtk_widget.connect_leave_notify_event(move |_, evt| {
+                if evt.detail() != NotifyType::Inferior {
+                    keyboard_handler2.borrow_mut().clear();
+                }
+                gtk::Inhibit(false)
+            }));
+
+            connect_signal_handler!(gtk_widget, gtk_widget.connect_key_press_event(move |_, evt| {
+                if let Some(keys) = keyboard_handler1.borrow_mut().key_event(evt) {
+                    run_command(timeout, &keypress1, &[keys]);
+                }
+                gtk::Inhibit(false)
+            }));
+
+            connect_signal_handler!(gtk_widget, gtk_widget.connect_key_release_event(move |_, _| {
+                let mut kbd = keyboard_handler.borrow_mut();
+                if let Some(keys) = kbd.get_keys() {
+                    run_command(timeout, &keypress, &[keys]);
+                }
+                kbd.clear();
+                gtk::Inhibit(false)
+            }));
         }
     });
 
     Ok(gtk_widget)
+}
+
+#[derive(Debug)]
+struct KeyboardHandler {
+    pressed_keys: HashSet<String>,
+}
+
+impl KeyboardHandler {
+    fn new() -> KeyboardHandler {
+        KeyboardHandler { pressed_keys: HashSet::new() }
+    }
+
+    fn clear(&mut self) {
+        self.pressed_keys.clear();
+    }
+
+    fn key_event(&mut self, evt: &EventKey) -> Option<String> {
+        let mut keychar = String::new();
+
+        if let Some(unicode) = evt.keyval().to_unicode() {
+            keychar.push(unicode);
+        } else if let Some(keyname) = evt.keyval().name() {
+            keychar.push_str(keyname.as_ref());
+        }
+
+        if self.pressed_keys.insert(keychar) {
+            None
+        } else {
+            self.get_keys()
+        }
+    }
+
+    fn get_keys(&mut self) -> Option<String> {
+        let result: Vec<String> = self
+            .pressed_keys
+            .clone()
+            .iter()
+            .map(|key| {
+                let keymapped = match key.as_str() {
+                    "\t" => "tab",
+                    " " => "space",
+                    "\r" => "return",
+                    "\u{7f}" => "delete",
+                    "\u{1b}" => "escape",
+                    "\u{8}" => "backspace",
+                    "Alt_L" | "Alt_R" | "Meta_L" | "Meta_R" => "alt",
+                    "Control_L" | "Control_R" => "ctrl",
+                    "Shift_L" | "Shift_R" => "shift",
+                    "Super_L" | "Super_R" => "super",
+                    "Page_Down" => "pagedown",
+                    "Page_Up" => "pageup",
+                    "ISO_Level3_Shift" => "altgr",
+                    key => key,
+                };
+
+                keymapped.to_lowercase()
+            })
+            .collect();
+
+        if !result.is_empty() {
+            Some(result.join("+"))
+        } else {
+            None
+        }
+    }
 }
 
 const WIDGET_NAME_LABEL: &str = "label";
