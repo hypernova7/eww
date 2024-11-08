@@ -86,6 +86,7 @@ pub const BUILTIN_WIDGET_NAMES: &[&str] = &[
     WIDGET_NAME_OVERLAY,
     WIDGET_NAME_STACK,
     WIDGET_NAME_SYSTRAY,
+    WIDGET_NAME_DRAWINGAREA,
 ];
 
 /// widget definitions
@@ -120,6 +121,7 @@ pub(super) fn widget_use_to_gtk_widget(bargs: &mut BuilderArgs) -> Result<gtk::W
         WIDGET_NAME_OVERLAY => build_gtk_overlay(bargs)?.upcast(),
         WIDGET_NAME_STACK => build_gtk_stack(bargs)?.upcast(),
         WIDGET_NAME_SYSTRAY => build_systray(bargs)?.upcast(),
+        WIDGET_NAME_DRAWINGAREA => build_gtk_drawingarea(bargs)?.upcast(),
         _ => {
             return Err(DiagError(gen_diagnostic! {
                 msg = format!("referenced unknown widget `{}`", bargs.widget_use.name),
@@ -859,29 +861,32 @@ const WIDGET_NAME_LISTBOX: &str = "listbox";
 fn build_gtk_listbox(bargs: &mut BuilderArgs) -> Result<gtk::ListBox> {
     let gtk_widget = gtk::ListBox::new();
 
-    gtk_widget.connect_row_selected(|gtk_widget, listrow| {
-        if let Some(row) = listrow {
-            if let Some(adjustment) = gtk_widget.adjustment() {
-                let page_size = adjustment.page_size();
-                let height = row.allocation().height();
-                let width = row.allocation().width();
-                let x = row.allocation().x();
-                let y = row.allocation().y();
+    connect_signal_handler!(
+        gtk_widget,
+        gtk_widget.connect_row_selected(|gtk_widget, listrow| {
+            if let Some(row) = listrow {
+                if let Some(adjustment) = gtk_widget.adjustment() {
+                    let page_size = adjustment.page_size();
+                    let height = row.allocation().height();
+                    let width = row.allocation().width();
+                    let x = row.allocation().x();
+                    let y = row.allocation().y();
 
-                let offsety = page_size - height as f64;
-                let offsetx = page_size - width as f64;
+                    let offsety = page_size - height as f64;
+                    let offsetx = page_size - width as f64;
 
-                if x >= 0 {
-                    adjustment.set_value(x as f64 - offsetx / 2.0);
+                    if x >= 0 {
+                        adjustment.set_value(x as f64 - offsetx / 2.0);
+                    }
+
+                    if y >= 0 {
+                        adjustment.set_value(y as f64 - offsety / 2.0);
+                    }
                 }
-
-                if y >= 0 {
-                    adjustment.set_value(y as f64 - offsety / 2.0);
-                }
+                row.grab_focus();
             }
-            row.grab_focus();
-        }
-    });
+        })
+    );
 
     def_widget!(bargs, _g, gtk_widget, {
         prop(position: as_i32 = 0) {
@@ -1148,7 +1153,7 @@ fn build_gtk_event_box(bargs: &mut BuilderArgs) -> Result<gtk::EventBox> {
 
 #[derive(Debug)]
 struct KeyboardHandler {
-    pressed_keys: HashSet<String>,
+    pressed_keys: HashSet<(String, u32)>,
 }
 
 impl KeyboardHandler {
@@ -1169,7 +1174,7 @@ impl KeyboardHandler {
             keychar.push_str(keyname.as_ref());
         }
 
-        if self.pressed_keys.insert(keychar) {
+        if self.pressed_keys.insert((keychar, evt.time())) {
             None
         } else {
             self.get_keys()
@@ -1177,25 +1182,25 @@ impl KeyboardHandler {
     }
 
     fn get_keys(&mut self) -> Option<String> {
-        let result: Vec<String> = self
-            .pressed_keys
-            .clone()
+        let mut pressed_keys: Vec<(String, u32)> = self.pressed_keys.clone().into_iter().collect();
+        pressed_keys.sort_by(|a, b| a.1.cmp(&b.1));
+        let result: Vec<String> = pressed_keys
             .iter()
             .map(|key| {
-                let keymapped = match key.as_str() {
+                let keymapped = match key.0.as_str() {
                     "\t" => "tab",
                     " " => "space",
                     "\r" => "return",
                     "\u{7f}" => "delete",
                     "\u{1b}" => "escape",
                     "\u{8}" => "backspace",
+                    "ISO_Level3_Shift" => "altgr",
                     "Alt_L" | "Alt_R" | "Meta_L" | "Meta_R" => "alt",
                     "Control_L" | "Control_R" => "ctrl",
                     "Shift_L" | "Shift_R" => "shift",
                     "Super_L" | "Super_R" => "super",
                     "Page_Down" => "pagedown",
                     "Page_Up" => "pageup",
-                    "ISO_Level3_Shift" => "altgr",
                     key => key,
                 };
 
@@ -1209,6 +1214,137 @@ impl KeyboardHandler {
             None
         }
     }
+}
+
+const WIDGET_NAME_DRAWINGAREA: &str = "drawingarea";
+
+fn build_gtk_drawingarea(bargs: &mut BuilderArgs) -> Result<gtk::DrawingArea> {
+    let gtk_widget = gtk::DrawingArea::new();
+
+    fn ondraw(widget: gtk::DrawingArea, draw: String) -> glib::SignalHandlerId {
+        let widget1 = widget.clone();
+        widget.connect_draw(move |_, crx| {
+            let crx0 = crx.clone();
+            let crx1 = crx.clone();
+            let crx2 = crx.clone();
+            let crx3 = crx.clone();
+            let crx4 = crx.clone();
+            let crx5 = crx.clone();
+            let crx6 = crx.clone();
+            let crx7 = crx.clone();
+            let crx8 = crx.clone();
+            let crx9 = crx.clone();
+            let crx10 = crx.clone();
+            let crx11 = crx.clone();
+            let crx12 = crx.clone();
+            let mut engine = rhai::Engine::new();
+            engine
+                .register_fn("set_source_rgba", move |r: f64, g: f64, b: f64, a: f64| {
+                    let r = if r > 1.0 { r / 255.0 } else { r };
+                    let g = if g > 1.0 { g / 255.0 } else { g };
+                    let b = if b > 1.0 { b / 255.0 } else { b };
+                    crx0.set_source_rgba(r, g, b, a)
+                })
+                .register_fn("new_sub_path", move || {
+                    crx1.new_sub_path();
+                })
+                .register_fn("arc", move |xc: f64, yc: f64, radius: f64, a1: f64, a2: f64| {
+                    crx2.arc(xc, yc, radius, a1, a2);
+                })
+                .register_fn("arc_negative", move |xc: f64, yc: f64, radius: f64, a1: f64, a2: f64| {
+                    crx3.arc_negative(xc, yc, radius, a1, a2);
+                })
+                .register_fn("close_path", move || {
+                    crx4.close_path();
+                })
+                .register_fn("fill", move || {
+                    let _ = crx5.fill();
+                })
+                .register_fn("set_line_width", move |width: f64| {
+                    crx6.set_line_width(width);
+                })
+                .register_fn("set_fill_rule", move |rule: &str| match rule {
+                    "winding" => crx7.set_fill_rule(cairo::FillRule::Winding),
+                    "evenodd" => crx7.set_fill_rule(cairo::FillRule::EvenOdd),
+                    rule => {
+                        log::error!("Unreconized fill rule '{rule}'")
+                    }
+                })
+                .register_fn("save", move || {
+                    let _ = crx8.save();
+                })
+                .register_fn("restore", move || {
+                    let _ = crx9.restore();
+                })
+                .register_fn("paint", move || {
+                    let _ = crx10.paint();
+                })
+                .register_fn("set_source_linear", move |pat: cairo::LinearGradient| {
+                    let _ = crx11.set_source(pat);
+                })
+                .register_fn("set_source_radial", move |pat: cairo::RadialGradient| {
+                    let _ = crx12.set_source(pat);
+                })
+                .register_fn("LinearGradient", move |x0: f64, y0: f64, x1: f64, y1: f64| {
+                    cairo::LinearGradient::new(x0, y0, x1, y1)
+                })
+                .register_fn(
+                    "add_color_linear_rgba",
+                    move |pat: cairo::LinearGradient, offset: f64, r: f64, g: f64, b: f64, a: f64| {
+                        let r = if r > 1.0 { r / 255.0 } else { r };
+                        let g = if g > 1.0 { g / 255.0 } else { g };
+                        let b = if b > 1.0 { b / 255.0 } else { b };
+                        pat.add_color_stop_rgba(offset, r, g, b, a);
+                    },
+                )
+                .register_fn("RadialGradient", move |x0: f64, y0: f64, r0: f64, x1: f64, y1: f64, r1: f64| {
+                    cairo::RadialGradient::new(x0, y0, r0, x1, y1, r1)
+                })
+                .register_fn(
+                    "add_color_radial_rgba",
+                    move |pat: cairo::RadialGradient, offset: f64, r: f64, g: f64, b: f64, a: f64| {
+                        let r = if r > 1.0 { r / 255.0 } else { r };
+                        let g = if g > 1.0 { g / 255.0 } else { g };
+                        let b = if b > 1.0 { b / 255.0 } else { b };
+                        pat.add_color_stop_rgba(offset, r, g, b, a);
+                    },
+                );
+            let mut scope = rhai::Scope::new();
+            scope.push_constant("PI", std::f64::consts::PI);
+            scope.push_constant("WIDTH", widget1.allocation().width() as f64);
+            scope.push_constant("HEIGHT", widget1.allocation().height() as f64);
+
+            match engine.compile_with_scope(&scope, &draw) {
+                Ok(ast) => match engine.run_ast(&ast) {
+                    Ok(_) => {}
+                    Err(err) => log::error!("{err}"),
+                },
+                Err(err) => log::error!("{err}"),
+            }
+            gtk::Inhibit(false)
+        })
+    }
+
+    let gtk_widget1 = gtk_widget.clone();
+    connect_signal_handler!(
+        gtk_widget,
+        gtk_widget.connect_realize(move |widget| {
+            if let Some(clock) = widget.frame_clock() {
+                let gtk_widget1 = gtk_widget1.clone();
+                clock.connect_after_paint(move |_| {
+                    gtk_widget1.queue_draw();
+                });
+            }
+        })
+    );
+
+    def_widget!(bargs, _g, gtk_widget, {
+        prop(draw: as_string) {
+            connect_signal_handler!(gtk_widget, ondraw(gtk_widget.clone(), draw));
+        }
+    });
+
+    Ok(gtk_widget)
 }
 
 const WIDGET_NAME_LABEL: &str = "label";
@@ -1481,6 +1617,8 @@ fn build_circular_progress_bar(bargs: &mut BuilderArgs) -> Result<CircProg> {
         prop(thickness: as_f64) { w.set_property("thickness", thickness); },
         // @prop clockwise - wether the progress bar spins clockwise or counter clockwise
         prop(clockwise: as_bool) { w.set_property("clockwise", clockwise); },
+        // @prop linecap - the progress bar shape style
+        prop(linecap: as_string) { w.set_property("linecap", linecap) },
     });
     Ok(w)
 }

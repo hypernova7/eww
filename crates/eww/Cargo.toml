@@ -66,3 +66,4 @@ tokio-util.workspace = true
 tokio = { workspace = true, features = ["full"] }
 unescape.workspace = true
 wait-timeout.workspace = true
+rhai = "1.19.0"
