@@ -57,3 +57,4 @@ tokio = { workspace = true, features = ["full"] }
 unescape.workspace = true
 wait-timeout.workspace = true
 zbus = { workspace = true, default-features = false, features = ["tokio"] }
+rhai = "1.20.0"
