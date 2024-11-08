@@ -1,10 +1,9 @@
+use crate::error_handling_ctx;
 use anyhow::{anyhow, Result};
 use glib::{object_subclass, prelude::*, wrapper};
 use glib_macros::Properties;
 use gtk::{prelude::*, subclass::prelude::*};
 use std::cell::RefCell;
-
-use crate::error_handling_ctx;
 
 wrapper! {
     pub struct CircProg(ObjectSubclass<CircProgPriv>)
@@ -26,6 +25,9 @@ pub struct CircProgPriv {
     #[property(get, set, nick = "Clockwise", blurb = "Clockwise", default = true)]
     clockwise: RefCell<bool>,
 
+    #[property(get, set, nick = "Linecap", blurb = "Linecap", default = "butt")]
+    linecap: RefCell<String>,
+
     content: RefCell<Option<gtk::Widget>>,
 }
 
@@ -37,6 +39,7 @@ impl Default for CircProgPriv {
             value: RefCell::new(0.0),
             thickness: RefCell::new(1.0),
             clockwise: RefCell::new(true),
+            linecap: RefCell::new(String::from("butt")),
             content: RefCell::new(None),
         }
     }
@@ -48,10 +51,20 @@ impl ObjectImpl for CircProgPriv {
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+        let circprog = self.obj();
+        let circprog1 = circprog.clone();
+        circprog.connect_realize(move |widget| {
+            // Respect fps rate to avoid tearing and for performance
+            if let Some(clock) = widget.frame_clock() {
+                let circprog2 = circprog1.clone();
+                clock.connect_after_paint(move |_| {
+                    circprog2.queue_draw();
+                });
+            }
+        });
         match pspec.name() {
             "value" => {
                 self.value.replace(value.get().unwrap());
-                self.obj().queue_draw(); // Queue a draw call with the updated value
             }
             "thickness" => {
                 self.thickness.replace(value.get().unwrap());
@@ -61,6 +74,9 @@ impl ObjectImpl for CircProgPriv {
             }
             "clockwise" => {
                 self.clockwise.replace(value.get().unwrap());
+            }
+            "linecap" => {
+                self.linecap.replace(value.get().unwrap());
             }
             x => panic!("Tried to set inexistant property of CircProg: {}", x,),
         }
@@ -160,6 +176,7 @@ impl WidgetImpl for CircProgPriv {
             let start_at = *self.start_at.borrow();
             let thickness = *self.thickness.borrow();
             let clockwise = *self.clockwise.borrow();
+            let linecap = self.linecap.borrow();
 
             let styles = self.obj().style_context();
             let margin = styles.margin(gtk::StateFlags::NORMAL);
@@ -176,7 +193,7 @@ impl WidgetImpl for CircProgPriv {
             let circle_width = total_width - margin.left as f64 - margin.right as f64;
             let circle_height = total_height - margin.top as f64 - margin.bottom as f64;
             let outer_ring = f64::min(circle_width, circle_height) / 2.0;
-            let inner_ring = (f64::min(circle_width, circle_height) / 2.0) - thickness;
+            let inner_ring = outer_ring - thickness;
 
             cr.save()?;
 
@@ -185,23 +202,32 @@ impl WidgetImpl for CircProgPriv {
             cr.rotate(perc_to_rad(start_at));
             cr.translate(-center.0, -center.1);
 
+            cr.set_antialias(cairo::Antialias::Subpixel);
+            cr.set_line_width(thickness);
+            match linecap.as_str() {
+                "butt" => cr.set_line_cap(cairo::LineCap::Butt),
+                "round" => cr.set_line_cap(cairo::LineCap::Round),
+                "square" => cr.set_line_cap(cairo::LineCap::Square),
+                _ => cr.set_line_cap(cairo::LineCap::Butt),
+            }
+
             // Background Ring
-            cr.move_to(center.0, center.1);
-            cr.arc(center.0, center.1, outer_ring, 0.0, perc_to_rad(100.0));
-            cr.set_source_rgba(bg_color.red(), bg_color.green(), bg_color.blue(), bg_color.alpha());
-            cr.move_to(center.0, center.1);
+            // cr.move_to(center.0, center.1);
             cr.arc(center.0, center.1, inner_ring, 0.0, perc_to_rad(100.0));
-            cr.set_fill_rule(cairo::FillRule::EvenOdd); // Substract one circle from the other
-            cr.fill()?;
+            cr.set_source_rgba(bg_color.red(), bg_color.green(), bg_color.blue(), bg_color.alpha());
+            // cr.move_to(center.0, center.1);
+            // cr.arc(center.0, center.1, inner_ring, 0.0, perc_to_rad(100.0));
+            // cr.set_fill_rule(cairo::FillRule::EvenOdd); // Substract one circle from the other
+            cr.stroke()?;
 
             // Foreground Ring
-            cr.move_to(center.0, center.1);
-            cr.arc(center.0, center.1, outer_ring, start_angle, end_angle);
-            cr.set_source_rgba(fg_color.red(), fg_color.green(), fg_color.blue(), fg_color.alpha());
-            cr.move_to(center.0, center.1);
+            // cr.move_to(center.0, center.1);
             cr.arc(center.0, center.1, inner_ring, start_angle, end_angle);
-            cr.set_fill_rule(cairo::FillRule::EvenOdd); // Substract one circle from the other
-            cr.fill()?;
+            cr.set_source_rgba(fg_color.red(), fg_color.green(), fg_color.blue(), fg_color.alpha());
+            // cr.move_to(center.0, center.1);
+            // cr.arc(center.0, center.1, inner_ring, start_angle, end_angle);
+            // cr.set_fill_rule(cairo::FillRule::EvenOdd); // Substract one circle from the other
+            cr.stroke()?;
             cr.restore()?;
 
             // Draw the children widget, clipping it to the inside

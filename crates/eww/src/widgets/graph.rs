@@ -86,12 +86,22 @@ impl ObjectImpl for GraphPriv {
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+        let graph = self.obj();
+        let graph1 = graph.clone();
+        graph.connect_realize(move |widget| {
+            // Respect fps rate to avoid tearing and for performance
+            if let Some(clock) = widget.frame_clock() {
+                let graph2 = graph1.clone();
+                clock.connect_after_paint(move |_| {
+                    graph2.queue_draw();
+                });
+            }
+        });
         match pspec.name() {
             "value" => {
                 let value = value.get().unwrap();
                 self.value.replace(value);
                 self.update_history((std::time::Instant::now(), value));
-                self.obj().queue_draw();
             }
             "thickness" => {
                 self.thickness.replace(value.get().unwrap());
