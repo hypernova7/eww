@@ -8,21 +8,17 @@ use crate::{
 use anyhow::{anyhow, Context, Result};
 use codespan_reporting::diagnostic::Severity;
 use eww_shared_util::Spanned;
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::Mutex;
 
-use gdk::{ModifierType, NotifyType};
+use gdk::{EventKey, ModifierType, NotifyType};
 use glib::translate::FromGlib;
 use gtk::{self, glib, prelude::*, DestDefaults, TargetEntry, TargetList};
-use gtk::{gdk, pango};
+use gtk::{cairo, gdk, gdk::ffi::gdk_cairo_surface_create_from_pixbuf, pango};
 use itertools::Itertools;
-use once_cell::sync::Lazy;
 
-use std::{
-    cell::RefCell,
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    rc::Rc,
-    time::Duration,
-};
+use std::{cell::RefCell, cmp::Ordering, collections::HashMap, rc::Rc, time::Duration};
 use yuck::{
     config::file_provider::YuckFileProvider,
     error::{DiagError, DiagResult},
@@ -81,9 +77,14 @@ pub const BUILTIN_WIDGET_NAMES: &[&str] = &[
     WIDGET_NAME_CHECKBOX,
     WIDGET_NAME_REVEALER,
     WIDGET_NAME_SCROLL,
+    WIDGET_NAME_LISTBOX,
+    WIDGET_NAME_LISTROW,
+    WIDGET_NAME_MENU,
+    WIDGET_NAME_MENU_OPTION,
     WIDGET_NAME_OVERLAY,
     WIDGET_NAME_STACK,
     WIDGET_NAME_SYSTRAY,
+    WIDGET_NAME_DRAWINGAREA,
 ];
 
 /// widget definitions
@@ -102,6 +103,7 @@ pub(super) fn widget_use_to_gtk_widget(bargs: &mut BuilderArgs) -> Result<gtk::W
         WIDGET_NAME_BUTTON => build_gtk_button(bargs)?.upcast(),
         WIDGET_NAME_LABEL => build_gtk_label(bargs)?.upcast(),
         WIDGET_NAME_LITERAL => build_gtk_literal(bargs)?.upcast(),
+        WIDGET_NAME_TEXTVIEW => build_gtk_textview(bargs)?.upcast(),
         WIDGET_NAME_INPUT => build_gtk_input(bargs)?.upcast(),
         WIDGET_NAME_CALENDAR => build_gtk_calendar(bargs)?.upcast(),
         WIDGET_NAME_COLOR_BUTTON => build_gtk_color_button(bargs)?.upcast(),
@@ -111,9 +113,14 @@ pub(super) fn widget_use_to_gtk_widget(bargs: &mut BuilderArgs) -> Result<gtk::W
         WIDGET_NAME_CHECKBOX => build_gtk_checkbox(bargs)?.upcast(),
         WIDGET_NAME_REVEALER => build_gtk_revealer(bargs)?.upcast(),
         WIDGET_NAME_SCROLL => build_gtk_scrolledwindow(bargs)?.upcast(),
+        WIDGET_NAME_LISTROW => build_gtk_listrow(bargs)?.upcast(),
+        WIDGET_NAME_LISTBOX => build_gtk_listbox(bargs)?.upcast(),
+        WIDGET_NAME_MENU_OPTION => build_gtk_menu_option(bargs)?.upcast(),
+        WIDGET_NAME_MENU => build_gtk_menu(bargs)?.upcast(),
         WIDGET_NAME_OVERLAY => build_gtk_overlay(bargs)?.upcast(),
         WIDGET_NAME_STACK => build_gtk_stack(bargs)?.upcast(),
         WIDGET_NAME_SYSTRAY => build_systray(bargs)?.upcast(),
+        WIDGET_NAME_DRAWINGAREA => build_gtk_drawingarea(bargs)?.upcast(),
         _ => {
             return Err(DiagError(gen_diagnostic! {
                 msg = format!("referenced unknown widget `{}`", bargs.widget_use.name),
@@ -126,8 +133,7 @@ pub(super) fn widget_use_to_gtk_widget(bargs: &mut BuilderArgs) -> Result<gtk::W
 }
 
 /// Deprecated attributes from top of widget hierarchy
-static DEPRECATED_ATTRS: Lazy<HashSet<&str>> =
-    Lazy::new(|| ["timeout", "onscroll", "onhover", "cursor"].iter().cloned().collect());
+static DEPRECATED_ATTRS: &[&str] = &["timeout", "onscroll", "onhover", "cursor"];
 
 /// attributes that apply to all widgets
 /// @widget widget
@@ -221,8 +227,83 @@ pub(super) fn resolve_widget_attrs(bargs: &mut BuilderArgs, gtk_widget: &gtk::Wi
             css_provider2.load_from_data(grass::from_string(css, &grass::Options::default())?.as_bytes())?;
             gtk_widget.style_context().add_provider(&css_provider2, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION)
         },
+        prop(menu: as_string) {
+            if let Ok(items) = serde_json::from_str::<Vec<ContextMenu>>(&menu) {
+                let context_menu = build_context_menu(items);
+                let context_menu2 = context_menu.clone();
+
+                gtk_widget.add_events(gdk::EventMask::KEY_PRESS_MASK);
+                gtk_widget.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+
+                connect_signal_handler!(
+                    gtk_widget,
+                    gtk_widget.connect_key_press_event(move |_, evt| {
+                        match evt.keyval().name() {
+                            Some(name) if name.as_str() == "Menu" => context_menu.popup_at_pointer(Some(evt)),
+                            _ => {}
+                        };
+
+                        glib::Propagation::Proceed
+                    })
+                );
+                connect_signal_handler!(
+                    gtk_widget,
+                    gtk_widget.connect_button_press_event(move |_, evt| {
+                        match evt.button() {
+                            1 => context_menu2.clone().popdown(),
+                            3 => context_menu2.clone().popup_at_pointer(Some(evt)),
+                            _ => {}
+                        };
+
+                        glib::Propagation::Proceed
+                    })
+                );
+            }
+        }
     });
     Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ContextMenu {
+    label: String,
+    action: Option<String>,
+    #[serde(default)]
+    timeout: Timeout,
+    submenu: Option<Vec<ContextMenu>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct Timeout(Duration);
+impl Default for Timeout {
+    fn default() -> Timeout {
+        Timeout(Duration::from_millis(200))
+    }
+}
+
+fn build_context_menu(items: Vec<ContextMenu>) -> gtk::Menu {
+    let context_menu = gtk::Menu::new();
+
+    for item in items {
+        let menu_item = gtk::MenuItem::with_label(&item.label);
+
+        if let Some(action) = item.action {
+            menu_item.connect_activate(move |_| {
+                run_command(item.timeout.0, &action, &[] as &[&str]);
+            });
+        }
+
+        if let Some(submenu) = item.submenu {
+            let menu = build_context_menu(submenu);
+            menu_item.set_submenu(Some(&menu));
+        }
+
+        context_menu.append(&menu_item);
+    }
+
+    context_menu.show_all();
+
+    context_menu
 }
 
 /// @widget !range
@@ -485,6 +566,31 @@ fn build_gtk_progress(bargs: &mut BuilderArgs) -> Result<gtk::ProgressBar> {
     Ok(gtk_widget)
 }
 
+fn parse_wrap_mode(w: &str) -> Result<gtk::WrapMode> {
+    enum_parse! { "wrap-mode", w,
+        "char" => gtk::WrapMode::Char,
+        "word" => gtk::WrapMode::Word,
+        "word-char" | "wordchar" => gtk::WrapMode::WordChar,
+        "none" => gtk::WrapMode::None,
+    }
+}
+
+const WIDGET_NAME_TEXTVIEW: &str = "textview";
+fn build_gtk_textview(bargs: &mut BuilderArgs) -> Result<gtk::TextView> {
+    let gtk_widget = gtk::TextView::new();
+
+    def_widget!(bargs, _g, gtk_widget, {
+        prop(editable: as_bool = true) {
+            gtk_widget.set_editable(editable);
+        },
+        prop(wrap_mode: as_string = "word") {
+            gtk_widget.set_wrap_mode(parse_wrap_mode(&wrap_mode)?);
+        }
+    });
+
+    Ok(gtk_widget)
+}
+
 const WIDGET_NAME_INPUT: &str = "input";
 /// @widget input
 /// @desc An input field. For this to be useful, set `focusable="true"` on the window.
@@ -494,6 +600,12 @@ fn build_gtk_input(bargs: &mut BuilderArgs) -> Result<gtk::Entry> {
         // @prop value - the content of the text field
         prop(value: as_string) {
             gtk_widget.set_text(&value);
+        },
+        prop(placeholder: as_string) {
+            gtk_widget.set_placeholder_text(Some(&placeholder));
+        },
+        prop(editable: as_bool = true) {
+            gtk_widget.set_editable(editable);
         },
         // @prop onchange - Command to run when the text changes. The placeholder `{}` will be replaced by the value
         // @prop timeout - timeout of the command. Default: "200ms"
@@ -591,6 +703,7 @@ fn build_gtk_image(bargs: &mut BuilderArgs) -> Result<gtk::Image> {
         // @prop preserve-aspect-ratio - whether to keep the aspect ratio when resizing an image. Default: true, false doesn't work for all image types
         // @prop fill-svg - sets the color of svg images
         prop(path: as_string, image_width: as_i32 = -1, image_height: as_i32 = -1, preserve_aspect_ratio: as_bool = true, fill_svg: as_string = "") {
+
             if !path.ends_with(".svg") && !fill_svg.is_empty() {
                 log::warn!("Fill attribute ignored, file is not an svg image");
             }
@@ -599,9 +712,13 @@ fn build_gtk_image(bargs: &mut BuilderArgs) -> Result<gtk::Image> {
                 let pixbuf_animation = gtk::gdk_pixbuf::PixbufAnimation::from_file(std::path::PathBuf::from(path))?;
                 gtk_widget.set_from_animation(&pixbuf_animation);
             } else {
-                let pixbuf;
+                let scale = gtk_widget.scale_factor();
+                let pixbuf: gtk::gdk_pixbuf::Pixbuf;
                 // populate the pixel buffer
-                if path.ends_with(".svg") && !fill_svg.is_empty() {
+                if path.ends_with(".svg") && !fill_svg.is_empty() { // render with fill
+                    let styles = gtk_widget.style_context();
+                    let color = styles.color(gtk::StateFlags::NORMAL);
+                    let _color = format!("#{:02x}{:02x}{:02x}", (color.red() * 255.0) as usize, (color.green() * 255.0) as usize, (color.blue() * 255.0) as usize);
                     let svg_data = std::fs::read_to_string(std::path::PathBuf::from(path.clone()))?;
                     // The fastest way to add/change fill color
                     let svg_data = if svg_data.contains("fill=") {
@@ -612,12 +729,24 @@ fn build_gtk_image(bargs: &mut BuilderArgs) -> Result<gtk::Image> {
                         reg.replace(&svg_data, &format!("<svg fill=\"{}\"", fill_svg))
                     };
                     let stream = gtk::gio::MemoryInputStream::from_bytes(&gtk::glib::Bytes::from(svg_data.as_bytes()));
-                    pixbuf = gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(&stream, image_width, image_height, preserve_aspect_ratio, None::<&gtk::gio::Cancellable>)?;
+                    pixbuf = gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(&stream, image_width * scale, image_height * scale, preserve_aspect_ratio, None::<&gtk::gio::Cancellable>)?;
                     stream.close(None::<&gtk::gio::Cancellable>)?;
                 } else {
-                    pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(std::path::PathBuf::from(path), image_width, image_height, preserve_aspect_ratio)?;
+                    pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(std::path::PathBuf::from(path), image_width * scale, image_height * scale, preserve_aspect_ratio)?;
+                    //gtk_widget.set_from_pixbuf(Some(&pixbuf));
                 }
-                gtk_widget.set_from_pixbuf(Some(&pixbuf));
+                // render to surface
+                let surface = unsafe {
+                    // gtk::cairo::Surface will destroy the underlying surface on drop
+                    let ptr = gdk_cairo_surface_create_from_pixbuf(
+                        pixbuf.as_ptr(),
+                        scale,
+                        std::ptr::null_mut(),
+                    );
+                    cairo::Surface::from_raw_full(ptr)?
+                };
+
+                gtk_widget.set_from_surface(Some(surface.as_ref()));
             }
         },
         // @prop icon - name of a theme icon
@@ -772,6 +901,126 @@ fn build_center_box(bargs: &mut BuilderArgs) -> Result<gtk::Box> {
     }
 }
 
+const WIDGET_NAME_MENU: &str = "menu";
+fn build_gtk_menu(bargs: &mut BuilderArgs) -> Result<gtk::Box> {
+    let gtk_widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let menu = gtk::Menu::new();
+
+    let children = bargs.widget_use.children.iter().map(|child| {
+        build_gtk_widget(
+            bargs.scope_graph,
+            bargs.widget_defs.clone(),
+            bargs.calling_scope,
+            child.clone(),
+            bargs.custom_widget_invocation.clone(),
+        )
+    });
+
+    for child in children {
+        if let Some(menu_item) = child?.dynamic_cast_ref::<gtk::MenuItem>() {
+            menu.append(menu_item);
+        }
+    }
+
+    gtk_widget.add_events(gdk::EventMask::BUTTON_PRESS_MASK);
+    connect_signal_handler!(
+        gtk_widget,
+        gtk_widget.connect_button_press_event(move |_, evt| {
+            match evt.button() {
+                1 => menu.popdown(),
+                3 => menu.popup_easy(evt.button(), evt.time()),
+                _ => {}
+            };
+
+            glib::Propagation::Proceed
+        })
+    );
+
+    Ok(gtk_widget)
+}
+
+const WIDGET_NAME_MENU_OPTION: &str = "option";
+fn build_gtk_menu_option(bargs: &mut BuilderArgs) -> Result<gtk::MenuItem> {
+    let gtk_widget = gtk::MenuItem::new();
+
+    def_widget!(bargs, _g, gtk_widget, {
+        prop(label: as_string) {
+            gtk_widget.set_label(&label);
+        },
+        prop(onclick: as_string, timeout: as_duration = Duration::from_millis(200)) {
+            gtk_widget.connect_activate(move |_| {
+                run_command(timeout, &onclick, &[] as &[&str]);
+            });
+        }
+    });
+
+    Ok(gtk_widget)
+}
+
+const WIDGET_NAME_LISTBOX: &str = "listbox";
+fn build_gtk_listbox(bargs: &mut BuilderArgs) -> Result<gtk::ListBox> {
+    let gtk_widget = gtk::ListBox::new();
+
+    connect_signal_handler!(
+        gtk_widget,
+        gtk_widget.connect_row_selected(|gtk_widget, listrow| {
+            if let Some(row) = listrow {
+                if let Some(adjustment) = gtk_widget.adjustment() {
+                    let page_size = adjustment.page_size();
+                    let height = row.allocation().height();
+                    let width = row.allocation().width();
+                    let x = row.allocation().x();
+                    let y = row.allocation().y();
+
+                    let offsety = page_size - height as f64;
+                    let offsetx = page_size - width as f64;
+
+                    if x >= 0 {
+                        adjustment.set_value(x as f64 - offsetx / 2.0);
+                    }
+
+                    if y >= 0 {
+                        adjustment.set_value(y as f64 - offsety / 2.0);
+                    }
+                }
+                row.grab_focus();
+            }
+        })
+    );
+
+    def_widget!(bargs, _g, gtk_widget, {
+        prop(position: as_i32 = 0) {
+            if position > 0 && gtk_widget.children().len() >= position as usize {
+                gtk_widget.select_row(gtk_widget.row_at_index(position).as_ref());
+            }
+        },
+        prop(mode: as_string = "single") {
+            match mode.as_str() {
+                "browse" => gtk_widget.set_selection_mode(gtk::SelectionMode::Browse),
+                "multiple" => gtk_widget.set_selection_mode(gtk::SelectionMode::Multiple),
+                "single" => gtk_widget.set_selection_mode(gtk::SelectionMode::Single),
+                _ => gtk_widget.set_selection_mode(gtk::SelectionMode::None),
+            }
+        }
+    });
+
+    Ok(gtk_widget)
+}
+
+const WIDGET_NAME_LISTROW: &str = "listrow";
+fn build_gtk_listrow(bargs: &mut BuilderArgs) -> Result<gtk::ListBoxRow> {
+    let gtk_widget = gtk::ListBoxRow::new();
+
+    def_widget!(bargs, _g, gtk_widget, {
+        prop(activatable: as_bool = true, selectable: as_bool = true) {
+            gtk_widget.set_activatable(activatable);
+            gtk_widget.set_selectable(selectable);
+        }
+    });
+
+    Ok(gtk_widget)
+}
+
 const WIDGET_NAME_SCROLL: &str = "scroll";
 /// @widget scroll
 /// @desc a container with a single child that can scroll.
@@ -821,6 +1070,16 @@ fn build_gtk_event_box(bargs: &mut BuilderArgs) -> Result<gtk::EventBox> {
     });
 
     gtk_widget.connect_button_release_event(|gtk_widget, _| {
+        gtk_widget.unset_state_flags(gtk::StateFlags::ACTIVE);
+        glib::Propagation::Proceed
+    });
+
+    gtk_widget.connect_key_press_event(|gtk_widget, _| {
+        gtk_widget.set_state_flags(gtk::StateFlags::ACTIVE, true);
+        glib::Propagation::Proceed
+    });
+
+    gtk_widget.connect_key_release_event(|gtk_widget, _| {
         gtk_widget.unset_state_flags(gtk::StateFlags::ACTIVE);
         glib::Propagation::Proceed
     });
@@ -952,8 +1211,287 @@ fn build_gtk_event_box(bargs: &mut BuilderArgs) -> Result<gtk::EventBox> {
                 }
                 glib::Propagation::Proceed
             }));
+        },
+        prop(timeout: as_duration = Duration::from_millis(200), onkeypress: as_string) {
+            gtk_widget.add_events(gdk::EventMask::KEY_PRESS_MASK);
+            gtk_widget.add_events(gdk::EventMask::KEY_RELEASE_MASK);
+            gtk_widget.add_events(gdk::EventMask::LEAVE_NOTIFY_MASK);
+
+            let keyboard_handler_ref = Arc::new(Mutex::new(KeyboardHandler::new()));
+            let keyboard_handler_ref1 = keyboard_handler_ref.clone();
+            let keyboard_handler_ref2 = keyboard_handler_ref.clone();
+            let onkeypress1 = onkeypress.clone();
+
+            connect_signal_handler!(gtk_widget, gtk_widget.connect_leave_notify_event(move |_, evt| {
+                if evt.detail() != NotifyType::Inferior {
+                    keyboard_handler_ref.lock().unwrap().clear();
+                }
+                glib::Propagation::Proceed
+            }));
+
+            connect_signal_handler!(gtk_widget, gtk_widget.connect_key_press_event(move |_, evt| {
+                if let Some(keys) = keyboard_handler_ref1.lock().unwrap().key_event(evt, KeyboardEvent::Press) {
+                    run_command(timeout, &onkeypress1, &[keys]);
+                }
+                glib::Propagation::Proceed
+            }));
+
+            connect_signal_handler!(gtk_widget, gtk_widget.connect_key_release_event(move |_, evt| {
+                if let Some(keys) = keyboard_handler_ref2.lock().unwrap().key_event(evt, KeyboardEvent::Release) {
+                    run_command(timeout, &onkeypress, &[keys]);
+                }
+                glib::Propagation::Proceed
+            }));
         }
     });
+
+    Ok(gtk_widget)
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum KeyboardEvent {
+    Press,
+    Release,
+    None,
+}
+
+#[derive(Debug)]
+struct KeyboardHandler {
+    pressed_keys: BTreeSet<String>,
+    timer: Option<glib::SourceId>,
+    evt_type: KeyboardEvent,
+}
+
+impl KeyboardHandler {
+    fn new() -> KeyboardHandler {
+        KeyboardHandler { pressed_keys: BTreeSet::new(), evt_type: KeyboardEvent::None, timer: None }
+    }
+
+    fn clear(&mut self) {
+        self.pressed_keys.clear();
+    }
+
+    fn reset_timer(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.remove();
+        }
+
+        let mut keys = self.pressed_keys.clone();
+
+        self.timer = Some(glib::timeout_add_local(Duration::from_millis(300), move || {
+            if !keys.is_empty() {
+                keys.clear();
+            }
+            glib::ControlFlow::Continue
+        }));
+    }
+
+    fn key_event(&mut self, evt: &EventKey, evt_type: KeyboardEvent) -> Option<String> {
+        self.evt_type = evt_type;
+        let mut keychar = String::new();
+
+        if let Some(unicode) = evt.keyval().to_unicode() {
+            keychar.push(unicode);
+        } else if let Some(keyname) = evt.keyval().name() {
+            keychar.push_str(keyname.as_ref());
+        }
+
+        match self.evt_type {
+            KeyboardEvent::Press => {
+                self.pressed_keys.insert(keychar);
+            }
+            KeyboardEvent::Release => {
+                self.pressed_keys.remove(&keychar);
+            }
+            KeyboardEvent::None => return None,
+        }
+
+        self.get_keys()
+    }
+
+    fn get_keys(&mut self) -> Option<String> {
+        let pressed_keys = self.pressed_keys.iter();
+        let result: Vec<String> = pressed_keys
+            .map(|key| {
+                let keymapped = match key.as_str() {
+                    "\t" => "tab",
+                    " " => "space",
+                    "\r" => "return",
+                    "\u{7f}" => "delete",
+                    "\u{1b}" => "escape",
+                    "\u{8}" => "backspace",
+                    "ISO_Level3_Shift" => "altgr",
+                    "Alt_L" | "Alt_R" | "Meta_L" | "Meta_R" => "alt",
+                    "Control_L" | "Control_R" => "ctrl",
+                    "Shift_L" | "Shift_R" => "shift",
+                    "Super_L" | "Super_R" => "super",
+                    "Page_Down" => "pagedown",
+                    "Page_Up" => "pageup",
+                    key => key,
+                };
+
+                keymapped.to_lowercase()
+            })
+            .collect();
+
+        self.reset_timer();
+
+        if !result.is_empty() {
+            return Some(result.join("+"));
+        }
+
+        None
+    }
+}
+
+const WIDGET_NAME_DRAWINGAREA: &str = "drawingarea";
+
+fn build_gtk_drawingarea(bargs: &mut BuilderArgs) -> Result<gtk::DrawingArea> {
+    let gtk_widget = gtk::DrawingArea::new();
+
+    fn load_script(
+        widget: gtk::DrawingArea,
+        ctx: Rc<RefCell<cairo::Context>>,
+        raw: &str,
+        script_string_or_path: &str,
+    ) -> glib::Propagation {
+        let mut script_to_render = String::from(script_string_or_path);
+
+        match std::fs::metadata(script_string_or_path) {
+            Ok(metadata) if metadata.is_file() => {
+                if let Ok(script_content) = std::fs::read_to_string(script_string_or_path) {
+                    script_to_render = script_content;
+                }
+            }
+            _ => {}
+        }
+
+        let script = format!("{raw}\n{script_to_render}");
+
+        let mut engine = rhai::Engine::new();
+        engine
+            .register_fn("set_source_rgba", {
+                let crx = ctx.clone();
+                move |r: f64, g: f64, b: f64, a: f64| {
+                    let r = if r > 1.0 { r / 255.0 } else { r };
+                    let g = if g > 1.0 { g / 255.0 } else { g };
+                    let b = if b > 1.0 { b / 255.0 } else { b };
+                    crx.borrow_mut().set_source_rgba(r, g, b, a)
+                }
+            })
+            .register_fn("new_sub_path", {
+                let crx = ctx.clone();
+                move || crx.borrow_mut().new_sub_path()
+            })
+            .register_fn("arc", {
+                let crx = ctx.clone();
+                move |xc: f64, yc: f64, radius: f64, a1: f64, a2: f64| crx.borrow_mut().arc(xc, yc, radius, a1, a2)
+            })
+            .register_fn("arc_negative", {
+                let crx = ctx.clone();
+                move |xc: f64, yc: f64, radius: f64, a1: f64, a2: f64| crx.borrow_mut().arc_negative(xc, yc, radius, a1, a2)
+            })
+            .register_fn("close_path", {
+                let crx = ctx.clone();
+                move || crx.borrow_mut().close_path()
+            })
+            .register_fn("fill", {
+                let crx = ctx.clone();
+                move || crx.borrow_mut().fill()
+            })
+            .register_fn("set_line_width", {
+                let crx = ctx.clone();
+                move |width: f64| crx.borrow_mut().set_line_width(width)
+            })
+            .register_fn("set_fill_rule", {
+                let crx = ctx.clone();
+                move |rule: &str| match rule {
+                    "winding" => crx.borrow_mut().set_fill_rule(cairo::FillRule::Winding),
+                    "evenodd" => crx.borrow_mut().set_fill_rule(cairo::FillRule::EvenOdd),
+                    rule => {
+                        log::error!("Unreconized fill rule '{rule}'")
+                    }
+                }
+            })
+            .register_fn("save", {
+                let crx = ctx.clone();
+                move || crx.borrow_mut().save()
+            })
+            .register_fn("restore", {
+                let crx = ctx.clone();
+                move || crx.borrow().restore()
+            })
+            .register_fn("paint", {
+                let crx = ctx.clone();
+                move || crx.borrow_mut().paint()
+            })
+            .register_fn("set_source_linear", {
+                let crx = ctx.clone();
+                move |pat: cairo::LinearGradient| crx.borrow_mut().set_source(pat)
+            })
+            .register_fn("set_source_radial", {
+                let crx = ctx.clone();
+                move |pat: cairo::RadialGradient| crx.borrow_mut().set_source(pat)
+            })
+            .register_fn("LinearGradient", move |x0: f64, y0: f64, x1: f64, y1: f64| cairo::LinearGradient::new(x0, y0, x1, y1))
+            .register_fn(
+                "add_color_linear_rgba",
+                move |pat: cairo::LinearGradient, offset: f64, r: f64, g: f64, b: f64, a: f64| {
+                    let r = if r > 1.0 { r / 255.0 } else { r };
+                    let g = if g > 1.0 { g / 255.0 } else { g };
+                    let b = if b > 1.0 { b / 255.0 } else { b };
+                    pat.add_color_stop_rgba(offset, r, g, b, a)
+                },
+            )
+            .register_fn("RadialGradient", move |x0: f64, y0: f64, r0: f64, x1: f64, y1: f64, r1: f64| {
+                cairo::RadialGradient::new(x0, y0, r0, x1, y1, r1)
+            })
+            .register_fn(
+                "add_color_radial_rgba",
+                move |pat: cairo::RadialGradient, offset: f64, r: f64, g: f64, b: f64, a: f64| {
+                    let r = if r > 1.0 { r / 255.0 } else { r };
+                    let g = if g > 1.0 { g / 255.0 } else { g };
+                    let b = if b > 1.0 { b / 255.0 } else { b };
+                    pat.add_color_stop_rgba(offset, r, g, b, a)
+                },
+            );
+
+        let mut scope = rhai::Scope::new();
+        scope.push_constant("PI", std::f64::consts::PI);
+        scope.push_constant("WIDTH", widget.allocation().width() as f64);
+        scope.push_constant("HEIGHT", widget.allocation().height() as f64);
+
+        match engine.compile_with_scope(&scope, &script) {
+            Ok(ast) => match engine.run_ast(&ast) {
+                Ok(_) => {}
+                Err(err) => log::error!("{err}"),
+            },
+            Err(err) => log::error!("{err}"),
+        }
+
+        glib::Propagation::Proceed
+    }
+
+    connect_signal_handler!(
+        gtk_widget,
+        gtk_widget.connect_realize(move |widget| {
+            if let Some(clock) = widget.frame_clock() {
+                let drawer1 = widget.clone();
+                clock.connect_after_paint(move |_| {
+                    drawer1.queue_draw();
+                });
+            }
+        })
+    );
+
+    def_widget!(bargs, _g, gtk_widget, {
+        prop(render_raw: as_string = "", render: as_string) {
+            connect_signal_handler!(gtk_widget, gtk_widget.connect_draw(move |widget, crx| {
+                load_script(widget.clone(), Rc::new(RefCell::new(crx.clone())), &render_raw, &render)
+            }));
+        }
+    });
+
     Ok(gtk_widget)
 }
 
@@ -1230,6 +1768,8 @@ fn build_circular_progress_bar(bargs: &mut BuilderArgs) -> Result<CircProg> {
         prop(thickness: as_f64) { w.set_property("thickness", thickness); },
         // @prop clockwise - wether the progress bar spins clockwise or counter clockwise
         prop(clockwise: as_bool) { w.set_property("clockwise", clockwise); },
+        // @prop linecap - the progress bar shape style
+        prop(linecap: as_string) { w.set_property("linecap", linecap) },
     });
     Ok(w)
 }

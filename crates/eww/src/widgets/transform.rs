@@ -60,10 +60,20 @@ impl ObjectImpl for TransformPriv {
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+        let transform = self.obj();
+        let transform1 = transform.clone();
+        transform.connect_realize(move |widget| {
+            // Respect fps rate to avoid tearing and for performance
+            if let Some(clock) = widget.frame_clock() {
+                let transform2 = transform1.clone();
+                clock.connect_after_paint(move |_| {
+                    transform2.queue_draw();
+                });
+            }
+        });
         match pspec.name() {
             "rotate" => {
                 self.rotate.replace(value.get().unwrap());
-                self.obj().queue_draw(); // Queue a draw call with the updated value
             }
             "transform-origin-x" => {
                 self.transform_origin_x.replace(value.get().unwrap());
@@ -75,19 +85,15 @@ impl ObjectImpl for TransformPriv {
             }
             "translate-x" => {
                 self.translate_x.replace(value.get().unwrap());
-                self.obj().queue_draw(); // Queue a draw call with the updated value
             }
             "translate-y" => {
                 self.translate_y.replace(value.get().unwrap());
-                self.obj().queue_draw(); // Queue a draw call with the updated value
             }
             "scale-x" => {
                 self.scale_x.replace(value.get().unwrap());
-                self.obj().queue_draw(); // Queue a draw call with the updated value
             }
             "scale-y" => {
                 self.scale_y.replace(value.get().unwrap());
-                self.obj().queue_draw(); // Queue a draw call with the updated value
             }
             x => panic!("Tried to set inexistant property of Transform: {}", x,),
         }
